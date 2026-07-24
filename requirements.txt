@@ -1,3 +1,12 @@
+# macOS Homebrew Python setup (optional):
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+#   brew install python
+#
+# Recommended install flow:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+
 Pillow>=9.0.0
 numpy>=1.21.0
 requests>=2.27.0

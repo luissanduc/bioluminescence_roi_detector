@@ -3,6 +3,8 @@ import sys
 import requests
 import base64
 import tempfile
+import re
+import argparse
 from PIL import Image
 import numpy as np
 import traceback
@@ -33,16 +35,9 @@ Example output for Comment2 field:
 # ---- README and Usage ----
 
 # ---- Config ----
-# Get API key from environment variable (never hardcode your key)
+# Get API key from environment variable (never hardcode your key).
+# Validation is deferred until runtime so CLI help and dry checks can run.
 API_KEY = os.environ.get("ROBOFLOW_API_KEY")
-if not API_KEY:
-    print(
-        "Error: ROBOFLOW_API_KEY environment variable is not set.\n"
-        "Please set it before running this script:\n"
-        "  export ROBOFLOW_API_KEY='your_api_key_here'\n"
-        "You can get your API key at: https://app.roboflow.com/settings/api"
-    )
-    sys.exit(1)
 
 # The public Roboflow model used for bioluminescence ROI detection.
 # This model detects dorsal (D) and ventral (V) mouse positions.
@@ -54,47 +49,188 @@ MODEL_VERSION = "8"
 CONFIDENCE = 0.80
 IOU_THRESHOLD = 0.5
 
-# Pixel-to-centimeter conversion factors by instrument.
-# The script reads the "Instrument:" field from AnalyzedClickInfo.txt and looks up
-# the matching value automatically. Add new instruments here as needed.
-INSTRUMENT_CM_PER_PIXEL = {
-    "ivis 50":      0.010253906250,
-    "ivis50":       0.010253906250,
-    "ivis 200":     0.011562500000,
-    "ivis200":      0.011562500000,
+# Instrument profiles define both cm/pixel and effective image geometry.
+# Add new instruments here as needed.
+INSTRUMENT_PROFILES = {
+    "ivis 50": {
+        "cm_per_pixel": 0.010253906250,
+        "target_width": 2048,
+        "target_height": 2048,
+    },
+    "ivis 200": {
+        "cm_per_pixel": 0.011562500000,
+        "target_width": 1920,
+        "target_height": 1920,
+    },
 }
-DEFAULT_CM_PER_PIXEL = 0.010253906250  # Fallback (IVIS 50) if instrument is not recognized
 
-TARGET_WIDTH = 2048
-TARGET_HEIGHT = 2048
+INSTRUMENT_ALIASES = {
+    "ivis 50": "ivis 50",
+    "ivis50": "ivis 50",
+    "ivis 200": "ivis 200",
+    "ivis200": "ivis 200",
+}
+
+DEFAULT_INSTRUMENT = "ivis 50"
+
+# Fiducials were originally authored for a 2048-wide reference canvas.
+REFERENCE_CANVAS_WIDTH = 2048.0
+REFERENCE_FIDUCIAL_X = {1: 200, 2: 600, 3: 1000, 4: 1400, 5: 1800}
+
+
+def require_api_key():
+    """Return API key or exit with a clear setup message."""
+    api_key = os.environ.get("ROBOFLOW_API_KEY") or API_KEY
+    if api_key:
+        return api_key
+    print(
+        "Error: ROBOFLOW_API_KEY environment variable is not set.\n"
+        "Please set it before running this script:\n"
+        "  export ROBOFLOW_API_KEY='your_api_key_here'\n"
+        "You can get your API key at: https://app.roboflow.com/settings/api"
+    )
+    sys.exit(1)
+
+
+def _profile_for_instrument(instrument_name):
+    canonical = INSTRUMENT_ALIASES.get(instrument_name.lower())
+    if canonical and canonical in INSTRUMENT_PROFILES:
+        return canonical, INSTRUMENT_PROFILES[canonical]
+    return None, None
+
+
+def _read_lines_if_exists(file_path):
+    if not os.path.exists(file_path):
+        return []
+    try:
+        with open(file_path, "r", errors="ignore") as f:
+            return f.readlines()
+    except Exception:
+        return []
+
+
+def _extract_field_value(lines, field_name):
+    """Extract the text after '<field_name>:' from the first matching line."""
+    prefix = f"{field_name.lower()}:"
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith(prefix):
+            return stripped.split(":", 1)[-1].strip()
+    return None
+
+
+def _extract_existing_roi_cm_per_pixel(lines):
+    """Read cm-per-pixel from pre-existing ROI lines when present."""
+    values = []
+    for line in lines:
+        if "cm per pixel=" not in line:
+            continue
+        m = re.search(r"cm per pixel=([0-9]*\.?[0-9]+)", line)
+        if m:
+            try:
+                values.append(float(m.group(1)))
+            except ValueError:
+                continue
+    if not values:
+        return None
+    return round(sum(values) / len(values), 12)
 
 
 # ---- Detect Instrument and Resolve cm/pixel ----
-def get_cm_per_pixel(txt_lines):
+def get_cm_per_pixel_info(folder_path, analyzed_lines):
     """
-    Read the 'Instrument:' field from an IVIS text file and return the matching
-    cm/pixel value. Falls back to DEFAULT_CM_PER_PIXEL if the instrument is unknown
-    or the field is absent.
+    Resolve cm/pixel + target geometry from IVIS metadata using multiple sources and return
+    provenance information:
+    1) Instrument/System Configuration/Lens fields (AnalyzedClickInfo + ClickInfo)
+    2) Existing ROI cm-per-pixel values in AnalyzedClickInfo
+    3) IVIS-50 profile fallback
     """
-    for line in txt_lines:
-        if line.strip().lower().startswith("instrument:"):
-            instrument = line.split(":", 1)[-1].strip()
-            instrument_lower = instrument.lower()
-            for key, value in INSTRUMENT_CM_PER_PIXEL.items():
-                if key in instrument_lower:
-                    print(f"  Instrument: {instrument} -> {value:.12f} cm/pixel")
-                    return value
-            print(
-                f"  Warning: Unrecognized instrument '{instrument}'. "
-                f"Using default {DEFAULT_CM_PER_PIXEL} cm/pixel. "
-                f"Add it to INSTRUMENT_CM_PER_PIXEL in the script if needed."
-            )
-            return DEFAULT_CM_PER_PIXEL
+    click_lines = _read_lines_if_exists(os.path.join(folder_path, "ClickInfo.txt"))
+    all_text = "\n".join(analyzed_lines + click_lines).lower()
+
+    evidence_fields = [
+        ("Instrument", _extract_field_value(analyzed_lines, "Instrument") or _extract_field_value(click_lines, "Instrument")),
+        (
+            "System Configuration",
+            _extract_field_value(analyzed_lines, "System Configuration")
+            or _extract_field_value(click_lines, "System Configuration"),
+        ),
+        ("Lens Type", _extract_field_value(analyzed_lines, "Lens Type") or _extract_field_value(click_lines, "Lens Type")),
+    ]
+
+    for key, value in evidence_fields:
+        if not value:
+            continue
+        value_lower = value.lower()
+        for instrument_key in INSTRUMENT_ALIASES:
+            if instrument_key in value_lower:
+                canonical, profile = _profile_for_instrument(instrument_key)
+                print(f"  Instrument profile resolved from metadata source '{key}'.")
+                return {
+                    "cm_per_pixel": profile["cm_per_pixel"],
+                    "target_width": profile["target_width"],
+                    "target_height": profile["target_height"],
+                    "instrument": canonical,
+                    "source": key,
+                    "evidence": value,
+                    "used_default": False,
+                }
+
+    # Some exports wrap system configuration to the next line (e.g., "IVIS 200\n Spectrum")
+    if "ivis 200" in all_text or "ivis200" in all_text:
+        profile = INSTRUMENT_PROFILES["ivis 200"]
+        print("  Instrument profile inferred from metadata text.")
+        return {
+            "cm_per_pixel": profile["cm_per_pixel"],
+            "target_width": profile["target_width"],
+            "target_height": profile["target_height"],
+            "instrument": "ivis 200",
+            "source": "metadata-text",
+            "evidence": "matched 'ivis 200' in metadata text",
+            "used_default": False,
+        }
+    if "ivis 50" in all_text or "ivis50" in all_text:
+        profile = INSTRUMENT_PROFILES["ivis 50"]
+        print("  Instrument profile inferred from metadata text.")
+        return {
+            "cm_per_pixel": profile["cm_per_pixel"],
+            "target_width": profile["target_width"],
+            "target_height": profile["target_height"],
+            "instrument": "ivis 50",
+            "source": "metadata-text",
+            "evidence": "matched 'ivis 50' in metadata text",
+            "used_default": False,
+        }
+
+    existing_roi_cm = _extract_existing_roi_cm_per_pixel(analyzed_lines)
+    if existing_roi_cm is not None:
+        default_profile = INSTRUMENT_PROFILES[DEFAULT_INSTRUMENT]
+        print(f"  Using existing ROI cm/pixel from file: {existing_roi_cm:.12f}")
+        return {
+            "cm_per_pixel": existing_roi_cm,
+            "target_width": default_profile["target_width"],
+            "target_height": default_profile["target_height"],
+            "instrument": "unknown",
+            "source": "existing-roi",
+            "evidence": "averaged existing 'cm per pixel=' values from ROI lines",
+            "used_default": False,
+        }
+
+    default_profile = INSTRUMENT_PROFILES[DEFAULT_INSTRUMENT]
     print(
-        f"  Warning: No 'Instrument:' field found in file. "
-        f"Using default {DEFAULT_CM_PER_PIXEL} cm/pixel."
+        f"  Warning: Could not infer instrument-specific cm/pixel. "
+        f"Using default {default_profile['cm_per_pixel']:.12f} cm/pixel "
+        f"({default_profile['target_width']}x{default_profile['target_height']})."
     )
-    return DEFAULT_CM_PER_PIXEL
+    return {
+        "cm_per_pixel": default_profile["cm_per_pixel"],
+        "target_width": default_profile["target_width"],
+        "target_height": default_profile["target_height"],
+        "instrument": DEFAULT_INSTRUMENT,
+        "source": "default",
+        "evidence": "no matching Instrument/System Configuration/Lens/ROI metadata",
+        "used_default": True,
+    }
 
 
 # ---- Check for Saturated Images through the ClickInfo/AnalyzedClickInfo ----
@@ -138,14 +274,14 @@ def normalize_tif_to_png(input_path):
 
 
 # ---- Call Roboflow API ----
-def call_roboflow_local_image(image_path):
+def call_roboflow_local_image(image_path, api_key):
     """Send an image to the Roboflow inference API and return predictions."""
     with open(image_path, "rb") as image_file:
         encoded = base64.b64encode(image_file.read()).decode("utf-8")
 
     url = (
         f"https://detect.roboflow.com/{PROJECT_ID}/{MODEL_VERSION}"
-        f"?api_key={API_KEY}&confidence={CONFIDENCE}&overlap={IOU_THRESHOLD}"
+        f"?api_key={api_key}&confidence={CONFIDENCE}&overlap={IOU_THRESHOLD}"
     )
     res = requests.post(url, data=encoded, headers={"Content-Type": "application/x-www-form-urlencoded"})
     res.raise_for_status()
@@ -189,16 +325,16 @@ def _return_cage(txt_lines):
 
 
 # ---- Normalize predictions to fixed output resolution ----
-def normalize_predictions(predictions, original_size):
-    """Scale bounding box coordinates from the original image size to TARGET_WIDTH x TARGET_HEIGHT."""
+def normalize_predictions(predictions, original_size, target_width, target_height):
+    """Scale bounding box coordinates from original size to instrument-specific target canvas."""
     orig_w, orig_h = original_size
     norm = []
     for pred in predictions:
         if pred["confidence"] < CONFIDENCE and pred.get("class", "") not in ["nsg_ventral", "nsg_dorsal"]:
             print(f"Skipping low confidence prediction: {pred}")
             continue
-        scale_x = TARGET_WIDTH / orig_w
-        scale_y = TARGET_HEIGHT / orig_h
+        scale_x = target_width / orig_w
+        scale_y = target_height / orig_h
         norm.append({
             "x": pred["x"] * scale_x,
             "y": pred["y"] * scale_y,
@@ -223,16 +359,11 @@ def make_roi_entry(index, pred, cm_per_pixel):
 
 
 # ---- Insert ROI Block into File ----
-def insert_rois_to_file(file_path, predictions, cm_per_pixel):
+def insert_rois_to_file(file_path, predictions, cm_per_pixel, target_width):
     """Assign predictions to fiducial ROI positions and write them to the IVIS text file."""
-    # Fiducial x-coordinates for the 5 ROI positions (pixels in 2048-wide image)
-    fiducials = {
-        "ROI 1": (200, 850),
-        "ROI 2": (600, 850),
-        "ROI 3": (1000, 850),
-        "ROI 4": (1400, 850),
-        "ROI 5": (1800, 850)
-    }
+    # Fiducial x-coordinates for the 5 ROI positions, scaled to target width.
+    scale_x = target_width / REFERENCE_CANVAS_WIDTH
+    fiducials = {f"ROI {i}": (x * scale_x, 850) for i, x in REFERENCE_FIDUCIAL_X.items()}
 
     # Assign each prediction to the nearest fiducial by x-coordinate
     assigned = {}
@@ -272,12 +403,14 @@ def insert_rois_to_file(file_path, predictions, cm_per_pixel):
 
 
 # ---- Walk Through Subdirectories ----
-def process_all_folders(base_directory):
+def process_all_folders(base_directory, cm_fallback_policy="warn"):
     """
     Recursively find all subdirectories containing AnalyzedClickInfo.txt and photograph.TIF,
     then run ROI detection on each.
     """
     written_rois = set()
+
+    api_key = require_api_key()
 
     folders = []
     for root, dirs, files in os.walk(base_directory):
@@ -296,18 +429,37 @@ def process_all_folders(base_directory):
 
         png_path = None
         try:
-            png_path, original_size = normalize_tif_to_png(tif_path)
-            results = call_roboflow_local_image(png_path)
-            predictions = normalize_predictions(results["predictions"], original_size)
-
             with open(txt_path, 'r') as f:
                 txt_lines = f.readlines()
 
             cage = _return_cage(txt_lines) or "UNKNOWN"
-            cm_per_pixel = get_cm_per_pixel(txt_lines)
+            cm_info = get_cm_per_pixel_info(root, txt_lines)
+            cm_per_pixel = cm_info["cm_per_pixel"]
+            target_width = cm_info["target_width"]
+            target_height = cm_info["target_height"]
+
+            if cm_info["used_default"]:
+                print(
+                    "  SAFETY: cm/pixel fell back to default "
+                    f"({cm_per_pixel:.12f}) for folder '{root}'."
+                )
+                print(f"  SAFETY: source={cm_info['source']}; evidence={cm_info['evidence']}")
+                if cm_fallback_policy == "skip":
+                    print("  SAFETY: skipping ROI write to prevent potential bad mapping.")
+                    continue
+
+            png_path, original_size = normalize_tif_to_png(tif_path)
+            results = call_roboflow_local_image(png_path, api_key)
+            predictions = normalize_predictions(
+                results["predictions"],
+                original_size,
+                target_width,
+                target_height,
+            )
 
             # Assign predictions to fiducial ROI numbers
-            fiducials = {1: 200, 2: 600, 3: 1000, 4: 1400, 5: 1800}
+            fiducial_scale = target_width / REFERENCE_CANVAS_WIDTH
+            fiducials = {roi_num: x * fiducial_scale for roi_num, x in REFERENCE_FIDUCIAL_X.items()}
             assigned = {}
             for pred in predictions:
                 pred_x = pred["x"]
@@ -327,7 +479,7 @@ def process_all_folders(base_directory):
                         filtered_preds.append(pred)
                         written_rois.add(key)
 
-            insert_rois_to_file(txt_path, filtered_preds, cm_per_pixel)
+            insert_rois_to_file(txt_path, filtered_preds, cm_per_pixel, target_width)
             print(f"  Updated: {txt_path} ({len(filtered_preds)} ROIs written)")
 
         except Exception as e:
@@ -340,13 +492,27 @@ def process_all_folders(base_directory):
 
 # ---- CLI Entrypoint ----
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python bioluminescence_roi_detector.py /path/to/parent_directory")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Detect dorsal/ventral ROIs and write ROI boxes into IVIS "
+            "AnalyzedClickInfo.txt files."
+        )
+    )
+    parser.add_argument("directory", help="Path to parent directory containing IVIS subfolders")
+    parser.add_argument(
+        "--cm-fallback-policy",
+        choices=["warn", "skip"],
+        default="warn",
+        help=(
+            "Safety behavior when cm/pixel inference falls back to default: "
+            "'warn' writes ROI with warning, 'skip' skips writing that folder."
+        ),
+    )
+    args = parser.parse_args()
 
-    directory = sys.argv[1]
+    directory = args.directory
     if not os.path.isdir(directory):
         print(f"Error: '{directory}' is not a valid directory")
         sys.exit(1)
 
-    process_all_folders(directory)
+    process_all_folders(directory, cm_fallback_policy=args.cm_fallback_policy)
